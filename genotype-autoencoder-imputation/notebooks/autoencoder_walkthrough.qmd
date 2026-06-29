@@ -1,0 +1,323 @@
+---
+title: "Genotype Imputation: Autoencoder vs IMPUTE2"
+author: "Thomas Marshall"
+date: 2025-11-24
+format:
+  html:
+    self-contained: true
+    fig-width: 6
+    fig-asp: 0.618
+    toc: true
+editor: visual
+execute:
+  echo: true
+  warning: false
+---
+
+# Overview
+
+This notebook walks through a small end-to-end pipeline comparing two
+approaches to genotype imputation for three SNPs in the *TAS2R38*
+bitter-taste receptor gene:
+
+1. **IMPUTE2** — a standard population-genetics imputation tool that
+   uses a reference haplotype panel (1000 Genomes) to probabilistically
+   infer missing genotypes.
+2. **A denoising autoencoder** — a small PyTorch model trained to
+   reconstruct a held-out SNP from the dosages of all other SNPs in
+   the sample's genotype matrix, learning linkage-disequilibrium
+   structure directly from data rather than a reference panel.
+
+The runnable pipeline lives in `R/` and `python/` as standalone
+scripts driven by `config.yml`. This notebook reproduces the same
+steps narratively, with all output and discussion inline.
+
+All paths below are resolved through `config.yml` — see that file to
+point the pipeline at your own data.
+
+# Part 1: IMPUTE2
+
+## 1) Setup
+
+```{r}
+library(data.table)
+library(tidyverse)
+library(yaml)
+
+cfg <- read_yaml(here::here("config.yml"))
+base_directory <- cfg$paths$base_directory
+
+impute2_exe <- file.path(base_directory, cfg$paths$impute2_exe)
+
+map_file    <- file.path(base_directory, cfg$paths$ref_panels$map_file)
+hap_file    <- file.path(base_directory, cfg$paths$ref_panels$hap_file)
+legend_file <- file.path(base_directory, cfg$paths$ref_panels$legend_file)
+
+gens_file   <- file.path(base_directory, cfg$paths$gene_files$gens_file)
+sample_file <- file.path(base_directory, cfg$paths$gene_files$sample_file)
+strand_file <- file.path(base_directory, cfg$paths$gene_files$strand_file)
+
+output_prefix <- cfg$paths$output_prefix
+```
+
+## 2) Running IMPUTE2
+
+```{r}
+impute_args <- c(
+  "-m", shQuote(map_file),
+  "-h", shQuote(hap_file),
+  "-l", shQuote(legend_file),
+  "-g", shQuote(gens_file),
+  "-sample_g", shQuote(sample_file),
+  "-strand_g", shQuote(strand_file),
+  "-Ne", as.character(cfg$impute2$Ne),
+  "-int", as.character(cfg$impute2$interval[1]), as.character(cfg$impute2$interval[2]),
+  "-o", shQuote(output_prefix)
+)
+
+system2(impute2_exe, args = impute_args)
+```
+
+## 3) Inspecting the target variants
+
+```{r}
+info_file <- paste0(output_prefix, "_info")
+info <- read.table(info_file, header = TRUE, stringsAsFactors = FALSE)
+
+tas_snps <- cfg$target$snps
+info_tas <- subset(info, snp_id %in% tas_snps)
+info_tas
+```
+
+## 4) Extracting dosages
+
+A dosage is the expected allele count at a locus -- a continuous
+value between 0 and 2, rather than a hard 0/1/2 genotype call.
+
+```{r}
+imputed <- fread(output_prefix, header = FALSE)
+imputed_tas <- imputed[V1 %in% tas_snps]
+
+n_samples <- (ncol(imputed_tas) - 5) / 3
+n_samples
+```
+
+## 5) Mapping sample IDs
+
+```{r}
+sample_df <- read.table(sample_file, header = TRUE, stringsAsFactors = FALSE)
+sample_ids <- sample_df$ID_2
+if (sample_ids[1] == "0") sample_ids <- sample_ids[-1]
+```
+
+## 6) Dosage extraction function
+
+```{r}
+get_dosage_from_row <- function(row, n_samples) {
+  row_vec <- as.numeric(row)
+  probs <- row_vec[6:(5 + 3 * n_samples)]
+  prob_mat <- matrix(probs, ncol = 3, byrow = TRUE)
+  # dosage = 0 * P(AA) + 1 * P(AB) + 2 * P(BB)
+  as.numeric(prob_mat %*% c(0, 1, 2))
+}
+```
+
+## 7) Dosages for the three TAS2R38 variants
+
+```{r}
+dosage_list <- lapply(tas_snps, function(snp) {
+  get_dosage_from_row(imputed_tas[V1 == snp], n_samples)
+})
+
+tas_dosages <- data.frame(sample_id = sample_ids)
+for (i in seq_along(tas_snps)) {
+  tas_dosages[[tas_snps[i]]] <- dosage_list[[i]]
+}
+
+head(tas_dosages)
+
+write.csv(tas_dosages, cfg$paths$impute2_dosages_csv, row.names = FALSE)
+```
+
+# Part 2: Autoencoder
+
+## 1) Building the full genotype matrix
+
+```{r}
+imputed <- fread(output_prefix, header = FALSE)
+
+dos_mat <- t(apply(imputed, 1, get_dosage_from_row, n_samples = n_samples))
+colnames(dos_mat) <- sample_ids
+rownames(dos_mat) <- imputed$V1
+
+X <- t(dos_mat)  # rows = samples, cols = SNPs
+
+write.csv(X, file = cfg$paths$genotype_matrix_csv, row.names = TRUE)
+```
+
+## 2) Training the autoencoder
+
+The model is a small encoder-decoder network. During training, the
+target SNP (`exm663431`) is randomly hidden for a fraction of samples
+in each batch, and loss is computed only at those hidden positions --
+this is what forces the network to learn to predict it from the
+surrounding genotype context rather than memorizing it.
+
+The full implementation lives in `python/autoencoder.py` and
+`python/train.py`; the cell below mirrors that logic for illustration.
+
+```{python}
+import sys
+sys.path.append("python")
+
+import yaml
+import numpy as np
+import pandas as pd
+import torch
+
+from autoencoder import (
+    AEConfig, normalize, build_missing_mask,
+    train_autoencoder, impute_target_snp
+)
+
+with open("config.yml") as f:
+    cfg = yaml.safe_load(f)
+
+df = pd.read_csv(cfg["paths"]["genotype_matrix_csv"], index_col=0)
+sample_ids = df.index.to_list()
+snp_ids = df.columns.to_list()
+
+X_np = df.to_numpy().astype(np.float32)
+X_norm, snp_mean, snp_std = normalize(X_np)
+missing_mask = build_missing_mask(X_norm)
+X_norm_filled = np.nan_to_num(X_norm, nan=0.0)
+
+target_snp = cfg["target"]["hide_snp"]
+target_j = snp_ids.index(target_snp)
+
+ae_cfg = AEConfig(**cfg["autoencoder"])
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+model = train_autoencoder(X_norm_filled, missing_mask, target_j, ae_cfg, device)
+```
+
+## 3) Generating imputed dosages
+
+```{python}
+recon_dosages = impute_target_snp(
+    model, X_norm_filled, target_j, snp_mean, snp_std, device
+)
+
+ae_full_df = pd.DataFrame(recon_dosages, index=sample_ids, columns=snp_ids)
+
+tas_snps_py = cfg["target"]["snps"]
+ae_dos_df = ae_full_df[tas_snps_py].copy()
+ae_dos_df.insert(0, "sample_id", sample_ids)
+
+ae_dos_df.to_csv(cfg["paths"]["ae_dosages_csv"], index=False)
+ae_dos_df.head()
+```
+
+# Part 3: Autoencoder vs IMPUTE2
+
+```{r}
+library(ggplot2)
+
+tas_imp <- fread(cfg$paths$impute2_dosages_csv)
+ae_raw  <- fread(cfg$paths$ae_dosages_csv)
+
+ae_tas <- ae_raw[, c("sample_id", tas_snps), with = FALSE]
+
+common_ids <- intersect(tas_imp$sample_id, ae_tas$sample_id)
+tas_imp_f <- tas_imp[sample_id %in% common_ids]
+ae_tas_f  <- ae_tas[sample_id %in% common_ids]
+
+setkey(tas_imp_f, sample_id)
+setkey(ae_tas_f,  sample_id)
+tas_imp_f <- tas_imp_f[order(sample_id)]
+ae_tas_f  <- ae_tas_f[order(sample_id)]
+
+stopifnot(identical(tas_imp_f$sample_id, ae_tas_f$sample_id))
+
+imp_long <- melt(tas_imp_f, id.vars = "sample_id", variable.name = "snp", value.name = "dos_imp")
+ae_long  <- melt(ae_tas_f,  id.vars = "sample_id", variable.name = "snp", value.name = "dos_ae")
+
+comp <- merge(imp_long, ae_long, by = c("sample_id", "snp"))
+comp[, diff := dos_ae - dos_imp]
+
+rmse_overall <- sqrt(mean(comp$diff^2, na.rm = TRUE))
+cor_overall  <- cor(comp$dos_imp, comp$dos_ae, use = "complete.obs")
+
+rmse_overall
+cor_overall
+
+comp_stats <- comp[, .(
+  cor  = cor(dos_imp, dos_ae, use = "complete.obs"),
+  rmse = sqrt(mean((dos_ae - dos_imp)^2, na.rm = TRUE))
+), by = snp]
+
+comp_stats
+```
+
+## Genotype accuracy (hard calls)
+
+```{r}
+to_geno <- function(d) {
+  ifelse(d < 0.5, 0L, ifelse(d < 1.5, 1L, 2L))
+}
+
+comp[, geno_imp := to_geno(dos_imp)]
+comp[, geno_ae  := to_geno(dos_ae)]
+
+acc_overall <- mean(comp$geno_imp == comp$geno_ae, na.rm = TRUE)
+acc_overall
+
+acc_by_snp <- comp[, .(accuracy = mean(geno_imp == geno_ae, na.rm = TRUE)), by = snp]
+acc_by_snp
+```
+
+## Diagnostic plots
+
+```{r}
+ggplot(comp[snp == "exm663431"], aes(x = dos_imp, y = dos_ae)) +
+  geom_point(alpha = 0.5) +
+  geom_abline(slope = 1, intercept = 0) +
+  labs(
+    title = "IMPUTE2 vs Autoencoder Dosages for exm663431",
+    x = "IMPUTE2 dosage",
+    y = "Autoencoder dosage"
+  )
+
+ggplot(comp, aes(x = (dos_imp + dos_ae) / 2, y = diff, color = snp)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_point(alpha = 0.5) +
+  labs(
+    title = "Difference: Autoencoder - IMPUTE2 Dosages",
+    x = "Mean dosage (IMPUTE2 & AE)",
+    y = "Difference (AE - IMPUTE2)"
+  )
+
+sub <- comp[snp %in% tas_snps]
+sub[, err_ae := abs(dos_imp - dos_ae)]
+
+ggplot(sub, aes(x = snp, y = err_ae)) +
+  geom_point(alpha = 0.6) +
+  labs(
+    title = "Imputation Error for exm663431",
+    subtitle = "Autoencoder vs IMPUTE2",
+    x = "SNP identity",
+    y = "Absolute error (autoencoder)"
+  ) +
+  theme_minimal()
+```
+
+# Discussion
+
+The autoencoder's accuracy depends heavily on how much linkage
+disequilibrium exists between the target SNP and the rest of the
+genotyped variants in the window -- it has no access to the 1000
+Genomes reference panel that gives IMPUTE2 its statistical power, so
+agreement between the two should be read as a rough concordance check
+rather than a ground-truth validation. A natural next step is testing
+this approach on a larger SNP window and a larger sample set, where
+the autoencoder has more LD signal to exploit.
