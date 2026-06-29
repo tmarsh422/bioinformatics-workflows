@@ -1,0 +1,41 @@
+# ------------------------------------------------------------------
+# Central configuration for the genotype-autoencoder-imputation project
+# Edit the paths below to match your local setup. Nothing else in the
+# R or Python code should contain a hardcoded path.
+# ------------------------------------------------------------------
+
+paths:
+  base_directory: "data/raw"
+
+  impute2_exe: "Softwares/impute_v2.3.0_Windows/impute2.exe"
+
+  ref_panels:
+    map_file: "RefPanels/genetic_map_chr7_combined_b37.txt"
+    hap_file: "RefPanels/1000GP_Phase3_chr7.hap/ALL.chr7.phase3_shapeit2_mvncall_integrated_v4.20130502.genotypes.breakmulti.2504Samples.impute.hap"
+    legend_file: "RefPanels/1000GP_Phase3_chr7.legend/1000GP_Phase3_chr7.legend"
+
+  gene_files:
+    gens_file: "GeneFiles/twin_chr7.gens"
+    sample_file: "GeneFiles/twin_chr7.sample"
+    strand_file: "GeneFiles/twin_chr7.strand.txt"
+
+  output_prefix: "outputs/chr7_TAS2R38_fixed_window.impute2"
+  genotype_matrix_csv: "outputs/toy_genotype_matrix.csv"
+  impute2_dosages_csv: "outputs/tas_dosages.csv"
+  ae_dosages_csv: "outputs/toy_autoencoder_dosages.csv"
+
+impute2:
+  Ne: 20000
+  interval: [141660000, 141690000]   # window surrounding TAS2R38
+
+target:
+  snps: ["exm663407", "exm663414", "exm663431"]
+  hide_snp: "exm663431"               # SNP the autoencoder learns to impute
+
+autoencoder:
+  bottleneck: 64
+  hidden_dim: 256
+  p_hide: 0.30
+  batch_size: 64
+  n_epochs: 265
+  learning_rate: 0.001
