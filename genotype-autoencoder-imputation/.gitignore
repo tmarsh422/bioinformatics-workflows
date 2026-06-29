@@ -1,0 +1,31 @@
+# --- Private / non-redistributable data ---
+data/raw/*
+!data/raw/.gitkeep
+
+# --- Generated outputs (regenerable from the pipeline) ---
+outputs/*
+!outputs/.gitkeep
+
+# --- R ---
+.Rhistory
+.RData
+.Rproj.user/
+*.Rproj
+
+# --- Python ---
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+venv/
+ae_env/
+*.egg-info/
+
+# --- Quarto ---
+/.quarto/
+*_files/
+*.html
+
+# --- OS / editor cruft ---
+.DS_Store
+Thumbs.db
+.vscode/
