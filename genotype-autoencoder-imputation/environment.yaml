@@ -1,0 +1,19 @@
+name: genotype-ae
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - r-base>=4.2
+  - r-data.table
+  - r-tidyverse
+  - r-ggplot2
+  - r-yaml
+  - r-here
+  - python=3.10
+  - numpy
+  - pandas
+  - matplotlib
+  - pyyaml
+  - pip
+  - pip:
+      - torch
